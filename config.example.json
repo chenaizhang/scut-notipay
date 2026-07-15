@@ -1,0 +1,27 @@
+{
+  "mode": "standalone",
+  "napcatWs": "ws://host.docker.internal:3001",
+  "napcatToken": "your_napcat_token",
+  "encryptionKey": "replace_with_a_long_random_secret",
+  "commandNames": ["scut-notipay", "snp"],
+  "billingRetryCount": 3,
+  "standalone": {
+    "id": "default",
+    "cardId": "your_card_id",
+    "password": "your_card_password",
+    "campus": "GZIC",
+    "name": "宿舍余额",
+    "fetchInterval": "1d",
+    "notification": {
+      "hour": 8,
+      "threshold": null,
+      "lines": "ewa",
+      "channel": {
+        "type": "feishu",
+        "name": "默认通知",
+        "webhookUrl": "https://open.feishu.cn/open-apis/bot/v2/hook/replace_me",
+        "secret": ""
+      }
+    }
+  }
+}

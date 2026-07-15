@@ -1,0 +1,19 @@
+services:
+  scut-notipay:
+    build:
+      context: .
+    image: scut-notipay:local
+    container_name: scut-notipay
+    restart: unless-stopped
+    init: true
+    environment:
+      TZ: Asia/Shanghai
+      DATA_PATH: /app/data/data.db
+    volumes:
+      - ./config.json:/app/config.json:ro
+      - scut-notipay-data:/app/data
+    extra_hosts:
+      - host.docker.internal:host-gateway
+
+volumes:
+  scut-notipay-data:

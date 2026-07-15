@@ -11,7 +11,7 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 // Database path - stored in project root
-const DB_PATH = path.join(__dirname, '..', '..', 'data.db');
+const DB_PATH = process.env.DATA_PATH || path.join(__dirname, '..', '..', 'data.db');
 
 // Master password for encrypting card passwords
 // In production, this should be stored in environment variables or secure key management
@@ -51,6 +51,7 @@ class StudentDatabase {
 
   constructor(dbPath: string = DB_PATH) {
     this.db = new Database(dbPath);
+    this.db.pragma('foreign_keys = ON');
     this.db.pragma('journal_mode = WAL'); // Better concurrency
     this.initializeDatabase();
   }
@@ -108,17 +109,45 @@ class StudentDatabase {
       )
     `;
 
+    const createNotificationChannelsSQL = `
+      CREATE TABLE IF NOT EXISTS notification_channels (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        qq_id TEXT NOT NULL,
+        type TEXT NOT NULL CHECK(type IN ('qq', 'feishu', 'dingtalk')),
+        name TEXT NOT NULL,
+        destination_key TEXT NOT NULL,
+        config_encrypted TEXT NOT NULL,
+        enabled INTEGER NOT NULL DEFAULT 1,
+        created_at TEXT DEFAULT (datetime('now', 'localtime')),
+        updated_at TEXT DEFAULT (datetime('now', 'localtime')),
+        UNIQUE(qq_id, type, destination_key),
+        UNIQUE(qq_id, name),
+        FOREIGN KEY (qq_id) REFERENCES students(qq_id) ON DELETE CASCADE
+      );
+
+      CREATE TABLE IF NOT EXISTS notification_rule_channels (
+        notification_id INTEGER NOT NULL,
+        channel_id INTEGER NOT NULL,
+        PRIMARY KEY(notification_id, channel_id),
+        FOREIGN KEY (notification_id) REFERENCES notifications(id) ON DELETE CASCADE,
+        FOREIGN KEY (channel_id) REFERENCES notification_channels(id) ON DELETE CASCADE
+      );
+    `;
+
     const createIndexSQL = `
       CREATE INDEX IF NOT EXISTS idx_qq_id ON students(qq_id);
       CREATE INDEX IF NOT EXISTS idx_card_id ON students(card_id);
       CREATE INDEX IF NOT EXISTS idx_billing_qq_id ON billing_history(qq_id);
       CREATE INDEX IF NOT EXISTS idx_billing_recorded_at ON billing_history(recorded_at);
       CREATE INDEX IF NOT EXISTS idx_chat ON notifications(chat_type, chat_id);
+      CREATE INDEX IF NOT EXISTS idx_notification_channels_owner ON notification_channels(qq_id);
+      CREATE INDEX IF NOT EXISTS idx_rule_channels_channel ON notification_rule_channels(channel_id);
     `;
 
     this.db.exec(createStudentsTableSQL);
     this.db.exec(createBillingHistoryTableSQL);
     this.db.exec(createNotificationsTableSQL);
+    this.db.exec(createNotificationChannelsSQL);
     this.db.exec(createIndexSQL);
 
     // Migration: Add lines column to notifications if it doesn't exist
@@ -667,7 +696,7 @@ class StudentDatabase {
 export const db = new StudentDatabase();
 
 // Create and export scheduler instance using the same database
-export const scheduler = new NotificationScheduler(db.getDatabase());
+export const scheduler = new NotificationScheduler(db.getDatabase(), MASTER_PASSWORD);
 
 // Export class for testing or custom instances
 export { StudentDatabase };

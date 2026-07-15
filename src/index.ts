@@ -7,6 +7,8 @@ import { getBills } from './utils/billing.js';
 import { db, scheduler, type Campus } from './utils/database.js';
 import { generateBillingCharts, generateBillingSummary } from './utils/presentation.js';
 import { APP_NAME, CAMPUSES, DATA_COLLECTION_BATCH_SIZE, GITHUB_LINK } from './utils/constants.js';
+import { NotificationService } from './notifications/service.js';
+import type { NotificationChannelType, WebhookChannelConfig } from './notifications/types.js';
 
 let commitHash: string;
 try {
@@ -277,6 +279,66 @@ const napcat = new NCWebsocket(
   false
 );
 
+const notificationService = new NotificationService(napcat);
+
+const isStandalone = config.mode === 'standalone';
+
+const configureStandaloneMode = () => {
+  const standalone = config.standalone;
+  if (!standalone) throw new Error('standalone 模式缺少 standalone 配置');
+  if (!['GZIC', 'DXC'].includes(standalone.campus)) {
+    throw new Error('standalone.campus 必须是 GZIC 或 DXC');
+  }
+  if (!standalone.cardId || standalone.cardId === 'your_card_id') {
+    throw new Error('请配置 standalone.cardId');
+  }
+  if (!standalone.password || standalone.password === 'your_card_password') {
+    throw new Error('请配置 standalone.password');
+  }
+
+  const ownerId = `standalone:${standalone.id || 'default'}`;
+  db.addStudent(
+    ownerId,
+    standalone.cardId,
+    standalone.campus as Campus,
+    standalone.password,
+    standalone.name,
+    undefined,
+    standalone.fetchInterval || '1d'
+  );
+
+  const notification = standalone.notification;
+  if (!notification) {
+    console.log('[Standalone] 未配置通知，仅定时采集数据。');
+    return;
+  }
+  const channelConfig = notification.channel;
+  if (!channelConfig || !['feishu', 'dingtalk'].includes(channelConfig.type)) {
+    throw new Error('standalone.notification.channel.type 必须是 feishu 或 dingtalk');
+  }
+  const webhookConfig: WebhookChannelConfig = {
+    webhookUrl: channelConfig.webhookUrl,
+    ...(channelConfig.secret ? { secret: channelConfig.secret } : {})
+  };
+  notificationService.validate({ type: channelConfig.type, config: webhookConfig });
+  const channel = scheduler.upsertChannel(
+    ownerId,
+    channelConfig.type,
+    channelConfig.name || '默认通知',
+    webhookConfig
+  );
+  const rule = scheduler.setNotification(
+    'private',
+    ownerId,
+    ownerId,
+    notification.hour,
+    notification.threshold ?? undefined,
+    notification.lines || 'ewa'
+  );
+  scheduler.setNotificationChannels(rule.id!, ownerId, [channel.id]);
+  console.log(`[Standalone] 配置已加载，通知时间为每天 ${notification.hour}:00。`);
+};
+
 // Small generic signallable promise: call `signal()` to resolve the promise.
 const createSignallable = <T>() => {
   // start with a noop resolver to avoid definite-assignment / non-null assertions
@@ -311,13 +373,13 @@ napcat.on('socket.close', () => {
 const parseMessage = (context: AllHandlers['message']) => {
   const message = context.message.find((m) => m.type === 'text');
   if (!message) return { command: null, args: null };
-  const text = message.data.text;
+  const text = message.data.text.trim();
   const segments = text
     .split(/\s+/)
-    .map((s) => s.trim().toLowerCase())
+    .map((s) => s.trim())
     .filter(Boolean);
   if (!segments.length) return { command: null, args: null };
-  const command = segments[0];
+  const command = segments[0].toLowerCase();
   if (!config.commandNames.includes(command)) return { command: null, args: null };
   return { command, args: segments.slice(1) };
 };
@@ -476,8 +538,7 @@ const sendNotificationForStudent = async (
       let messageText = `🏠 ${room}\n\n`;
       messageText += generateBillingSummary({ electric, water, ac }, change24h || undefined);
 
-      // Build message segments
-      const messageSegments: SendMessageSegment[] = [{ type: 'text', data: { text: messageText } }];
+      const chartImages: Array<{ filename: string; buffer: Buffer }> = [];
 
       // Add chart images
       if (history.length >= 2) {
@@ -489,28 +550,25 @@ const sendNotificationForStudent = async (
         }));
 
         const charts = await generateBillingCharts(chartData, room, lines);
-        for (const chart of charts) {
-          const base64Image = `base64://${chart.buffer.toString('base64')}`;
-          messageSegments.push({ type: 'image', data: { file: base64Image } });
+        for (const [index, chart] of charts.entries()) {
+          chartImages.push({ filename: `billing-${index + 1}.png`, buffer: chart.buffer });
         }
       }
 
-      // Send message
-      if (notification.chat_type && notification.chat_id) {
-        if (notification.chat_type === 'private') {
-          await napcat.send_private_msg({
-            user_id: parseInt(notification.chat_id),
-            message: messageSegments
-          });
-        } else {
-          await napcat.send_group_msg({
-            group_id: parseInt(notification.chat_id),
-            message: messageSegments
-          });
+      const channels = scheduler.getChannelsForNotification(notification.id!, qqId);
+      const payload = {
+        title: `宿舍余额提醒 · ${room}`,
+        text: messageText,
+        markdown: messageText.replace(/\n/g, '\n\n'),
+        images: chartImages
+      };
+      for (const channel of channels) {
+        try {
+          await notificationService.send(channel, payload);
+          console.log(`[Scheduler] Sent notification through ${channel.type} channel ${channel.id}`);
+        } catch (error) {
+          console.error(`[Scheduler] Failed channel ${channel.id} (${channel.type}):`, error);
         }
-        console.log(
-          `[Scheduler] Sent notification to ${notification.chat_type} ${notification.chat_id}`
-        );
       }
     } catch (error) {
       console.error(
@@ -655,15 +713,15 @@ const handleNotifyCommand = async (
   chatId: string,
   sendFn: (message: string) => Promise<void>
 ) => {
-  if (params.length < 1 || params.length > 3) {
+  if (params.length < 1 || params.length > 4) {
     await sendFn(
       `查询定时通知：${command} notify list\n` +
-        `设置定时通知：${command} notify <小时 (0-23)> [阈值] [通知项目]`
+        `设置定时通知：${command} notify <小时 (0-23)> [阈值] [通知项目] [channels=渠道ID,...]`
     );
     return;
   }
 
-  if (params[0] === 'list') {
+  if (params[0].toLowerCase() === 'list') {
     const notifications = scheduler.getNotificationsForUser(qqId);
     if (notifications.length === 0) {
       await sendFn('您还未设置定时通知。');
@@ -689,6 +747,10 @@ const handleNotifyCommand = async (
       if (notification.lines && notification.lines !== 'ewa') {
         message += ` [${notification.lines.toUpperCase()}]`;
       }
+      const channelNames = notification.id
+        ? scheduler.getChannelsForNotification(notification.id, qqId).map((channel) => channel.name)
+        : [];
+      message += ` → ${channelNames.join('、') || '未选择渠道'}`;
     }
     await sendFn(message);
     return;
@@ -702,10 +764,20 @@ const handleNotifyCommand = async (
 
   let threshold: number | undefined;
   let lines = 'ewa';
+  let channelIds: number[] | undefined;
 
   for (let i = 1; i < params.length; i++) {
     const param = params[i];
-    if (/^[ewaEWA]+$/.test(param)) {
+    if (param.toLowerCase().startsWith('channels=')) {
+      channelIds = param
+        .slice('channels='.length)
+        .split(',')
+        .map((id) => Number(id));
+      if (channelIds.length === 0 || channelIds.some((id) => !Number.isInteger(id) || id <= 0)) {
+        await sendFn('渠道格式错误。示例：channels=1,2');
+        return;
+      }
+    } else if (/^[ewaEWA]+$/.test(param)) {
       lines = param;
     } else {
       const val = parseFloat(param);
@@ -727,19 +799,130 @@ const handleNotifyCommand = async (
     return;
   }
 
+  const selectedChannels = channelIds ?? [scheduler.ensureQQChannel(qqId, chatType, chatId).id];
+  if (selectedChannels.some((id) => !scheduler.getChannel(id, qqId))) {
+    await sendFn('包含无效或不属于您的通知渠道，请先执行 channel list。');
+    return;
+  }
+
   // Set notification
-  scheduler.setNotification(chatType, chatId, qqId, hour, threshold, lines);
+  const notification = scheduler.setNotification(chatType, chatId, qqId, hour, threshold, lines);
+  scheduler.setNotificationChannels(notification.id!, qqId, selectedChannels);
 
   let message = `已设置每日 ${hour} 时在此${chatType === 'private' ? '私聊' : '群聊'}`;
   if (threshold !== undefined) {
     message += `当任一余额（${lines.toUpperCase()}）低于 ${threshold} 元时`;
   }
-  message += '发送账单报告。';
+  const channelNames = selectedChannels
+    .map((id) => scheduler.getChannel(id, qqId)?.name)
+    .filter(Boolean)
+    .join('、');
+  message += `通过 ${channelNames} 发送账单报告。`;
 
   await sendFn(message);
   console.log(
     `[Notify] Set notification for ${chatType} ${chatId}, QQ ${qqId}, hour ${hour}, threshold ${threshold ?? 'none'}, lines ${lines}`
   );
+};
+
+const handleChannelCommand = async (
+  params: string[],
+  qqId: string,
+  isPrivateChat: boolean,
+  sendFn: (message: string) => Promise<void>
+) => {
+  const action = params[0]?.toLowerCase();
+  if (!action || action === 'list') {
+    const channels = scheduler.getChannelsForUser(qqId);
+    if (channels.length === 0) {
+      await sendFn('暂无通知渠道。设置一次 QQ 通知后会自动创建 QQ 渠道。');
+      return;
+    }
+    await sendFn(
+      '通知渠道：\n' +
+        channels
+          .map((channel) => `- ${channel.id}: ${channel.name} [${channel.type}]${channel.enabled ? '' : '（停用）'}`)
+          .join('\n')
+    );
+    return;
+  }
+
+  if (!isPrivateChat) {
+    await sendFn('渠道配置可能包含密钥，请仅在 QQ 私聊中操作。');
+    return;
+  }
+  if (!db.getCredentials(qqId)) {
+    await sendFn('请先绑定校园卡账号。');
+    return;
+  }
+
+  if (action === 'add') {
+    const type = params[1]?.toLowerCase() as NotificationChannelType;
+    const name = params[2];
+    const webhookUrl = params[3];
+    const secret = params[4];
+    if (!['feishu', 'dingtalk'].includes(type) || !name || !webhookUrl || params.length > 5) {
+      await sendFn('用法：channel add <feishu|dingtalk> <名称> <webhook> [secret]');
+      return;
+    }
+    try {
+      const channelConfig: WebhookChannelConfig = {
+        webhookUrl,
+        ...(secret ? { secret } : {})
+      };
+      notificationService.validate({ type, config: channelConfig });
+      const channel = scheduler.addChannel(
+        qqId,
+        type as 'feishu' | 'dingtalk',
+        name,
+        channelConfig
+      );
+      await sendFn(
+        `已添加渠道 ${channel.id}: ${channel.name} [${channel.type}]。请执行 channel test ${channel.id} 测试。`
+      );
+    } catch (error) {
+      await sendFn(`添加失败：${error instanceof Error ? error.message : String(error)}`);
+    }
+    return;
+  }
+
+  const id = Number(params[1]);
+  if (!Number.isInteger(id) || id <= 0) {
+    await sendFn(`用法：channel ${action === 'delete' ? 'delete' : 'test'} <渠道ID>`);
+    return;
+  }
+  if (action === 'test') {
+    const channel = scheduler.getChannel(id, qqId);
+    if (!channel) {
+      await sendFn('渠道不存在。');
+      return;
+    }
+    try {
+      await notificationService.send(channel, {
+        title: 'SCUT Notipay 渠道测试',
+        text: '通知渠道配置成功。',
+        markdown: '通知渠道配置成功。',
+        images: []
+      });
+      await sendFn('测试消息发送成功。');
+    } catch (error) {
+      await sendFn(`测试失败：${error instanceof Error ? error.message : String(error)}`);
+    }
+    return;
+  }
+  if (action === 'delete') {
+    try {
+      await sendFn(
+        scheduler.deleteChannel(id, qqId)
+          ? '渠道已删除。'
+          : '渠道不存在，或 QQ 渠道不能删除。'
+      );
+    } catch (error) {
+      await sendFn(`删除失败：${error instanceof Error ? error.message : String(error)}`);
+    }
+    return;
+  }
+  await sendFn('用法：channel list | add | test | delete');
 };
 
 const handleUnnotifyCommand = async (
@@ -871,14 +1054,19 @@ const handleHelp = async (
     '4. 查询定时通知：\n' +
     `${command} notify list\n\n` +
     '5. 设置定时通知：\n' +
-    `${command} notify <小时 (0-23)> [阈值] [通知项目]\n` +
+    `${command} notify <小时 (0-23)> [阈值] [通知项目] [channels=渠道ID,渠道ID]\n` +
     `   例：${command} notify 20 10\n` +
     '   每天晚上 8 点当任一余额低于 10 元时发送账单报告。\n' +
     `   例：${command} notify 20 10 e\n` +
     '   每天晚上 8 点当电费低于 10 元时发送账单报告（仅包含电费图表）。\n\n' +
     '6. 取消定时通知：\n' +
     `${command} unnotify\n\n` +
-    '7. 设置更新间隔：\n' +
+    '7. 管理通知渠道（添加操作仅限私聊）：\n' +
+    `${command} channel list\n` +
+    `${command} channel add <feishu|dingtalk> <名称> <webhook> [secret]\n` +
+    `${command} channel test <渠道ID>\n` +
+    `${command} channel delete <渠道ID>\n\n` +
+    '8. 设置更新间隔：\n' +
     `${command} interval [时间间隔]\n` +
     `   例：${command} interval 12h\n\n` +
     '尖括号 <> 表示必填参数，中括号 [] 表示可选参数。\n' +
@@ -911,7 +1099,8 @@ napcat.on('message', async (context: AllHandlers['message']) => {
       await handleHelp(command, send);
       return;
     }
-    const [subcommand, ...params] = args;
+    const [rawSubcommand, ...params] = args;
+    const subcommand = rawSubcommand.toLowerCase();
     const qqId = context.sender.user_id.toString();
     const chatId = (isPrivateChat ? context.sender.user_id : context.group_id).toString();
 
@@ -1090,6 +1279,8 @@ napcat.on('message', async (context: AllHandlers['message']) => {
       await handleNotifyCommand(command, params, qqId, context.message_type, chatId, send);
     } else if (subcommand === 'unnotify') {
       await handleUnnotifyCommand(qqId, context.message_type, chatId, send);
+    } else if (subcommand === 'channel') {
+      await handleChannelCommand(params, qqId, isPrivateChat, send);
     } else if (subcommand === 'interval') {
       await handleIntervalCommand(command, params, qqId, send);
     }
@@ -1099,10 +1290,17 @@ napcat.on('message', async (context: AllHandlers['message']) => {
   }
 });
 
-await napcat.connect();
+if (isStandalone) {
+  configureStandaloneMode();
+  startHourlyTimer();
+  void runHourlyTasks();
+  console.log('[Standalone] 已启动，无需连接 NapCat。');
+} else {
+  await napcat.connect();
+}
 
 let shutdownInitiated = false;
-process.on('SIGINT', async () => {
+const shutdown = async () => {
   if (shutdownInitiated) {
     console.log('\nForce exiting...');
     process.exit(1);
@@ -1112,14 +1310,18 @@ process.on('SIGINT', async () => {
 
   stopHourlyTimer();
 
-  napcat.disconnect();
-
-  const timeout = new Promise<void>((resolve) => setTimeout(resolve, 5000));
-  await Promise.race([socketClose.promise, timeout]);
+  if (!isStandalone) {
+    napcat.disconnect();
+    const timeout = new Promise<void>((resolve) => setTimeout(resolve, 5000));
+    await Promise.race([socketClose.promise, timeout]);
+  }
 
   db.close();
   console.log('[SQLite] Database closed.');
 
   console.log('Process exited.');
   process.exit(0);
-});
+};
+
+process.on('SIGINT', shutdown);
+process.on('SIGTERM', shutdown);
