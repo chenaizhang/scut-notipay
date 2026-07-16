@@ -100,27 +100,53 @@ class NotificationScheduler {
   ): NotificationChannel {
     const encrypted = encryptionService.encrypt(JSON.stringify(config), this.masterPassword);
     const destinationKey = this.destinationKey(type, config);
-    this.db
-      .prepare(
-        `
-      INSERT INTO notification_channels (qq_id, type, name, destination_key, config_encrypted)
-      VALUES (?, ?, ?, ?, ?)
-      ON CONFLICT(qq_id, type, destination_key) DO UPDATE SET
-        name = excluded.name,
-        config_encrypted = excluded.config_encrypted,
-        enabled = 1,
-        updated_at = datetime('now', 'localtime')
-    `
-      )
-      .run(qqId, type, name, destinationKey, encrypted);
+    const channelId = this.db.transaction(() => {
+      const byName = this.db
+        .prepare('SELECT id FROM notification_channels WHERE qq_id = ? AND name = ?')
+        .get(qqId, name) as { id: number } | undefined;
+      const byDestination = this.db
+        .prepare(
+          `SELECT id FROM notification_channels
+           WHERE qq_id = ? AND type = ? AND destination_key = ?`
+        )
+        .get(qqId, type, destinationKey) as { id: number } | undefined;
+
+      if (byName && byDestination && byName.id !== byDestination.id) {
+        this.db
+          .prepare(
+            `INSERT OR IGNORE INTO notification_rule_channels (notification_id, channel_id)
+             SELECT notification_id, ? FROM notification_rule_channels WHERE channel_id = ?`
+          )
+          .run(byName.id, byDestination.id);
+        this.db.prepare('DELETE FROM notification_channels WHERE id = ?').run(byDestination.id);
+      }
+
+      const existingId = byName?.id ?? byDestination?.id;
+      if (existingId !== undefined) {
+        this.db
+          .prepare(
+            `UPDATE notification_channels SET
+               type = ?, name = ?, destination_key = ?, config_encrypted = ?,
+               enabled = 1, updated_at = datetime('now', 'localtime')
+             WHERE id = ?`
+          )
+          .run(type, name, destinationKey, encrypted, existingId);
+        return existingId;
+      }
+
+      return Number(
+        this.db
+          .prepare(
+            `INSERT INTO notification_channels
+               (qq_id, type, name, destination_key, config_encrypted)
+             VALUES (?, ?, ?, ?, ?)`
+          )
+          .run(qqId, type, name, destinationKey, encrypted).lastInsertRowid
+      );
+    })();
     const row = this.db
-      .prepare(
-        `
-      SELECT * FROM notification_channels
-      WHERE qq_id = ? AND type = ? AND destination_key = ?
-    `
-      )
-      .get(qqId, type, destinationKey) as StoredNotificationChannel;
+      .prepare('SELECT * FROM notification_channels WHERE id = ?')
+      .get(channelId) as StoredNotificationChannel;
     return this.decodeChannel(row);
   }
 
