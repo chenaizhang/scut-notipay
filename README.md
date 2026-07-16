@@ -1,14 +1,30 @@
 # scut-notipay
 
-基于 Node.js 与 node-napcat-ts 的应用程序，用于查询并提醒华南理工大学广州国际校区与大学城校区的宿舍缴费事项。
+用于查询华南理工大学广州国际校区和大学城校区宿舍余额，并按配置发送余额通知。
 
-## 配置
+系统提供两种互相独立的运行方式：独立模式只绑定一个校园网账号，通过飞书 Webhook 机器人发送通知；提供服务模式通过 NapCat 提供 QQ 命令交互，并可绑定多个校园网账号。部署前请选择其中一种模式。
 
-程序支持两种运行模式：无需 QQ 机器人的独立模式，以及兼容原有命令交互的 QQ 模式。
+## 独立模式
 
-### 独立模式（推荐）
+独立模式适合只需要自己使用的场景。支持自由选择日报，周报，月报以及余额报警四种类型通知。要求：在校园网内的电脑或服务器。
 
-复制示例配置后，将 `mode` 保持为 `standalone`，并填写 `standalone` 中的校园卡与通知配置：
+### 功能
+
+- 每四小时查询并记录一次余额，查询本身不发送通知。
+- 查询时间围绕 `00:00`、`04:00`、`08:00`、`12:00`、`16:00`、`20:00`，支持随机偏移。
+- 支持每日余额通知、低余额提醒、周报和月报，可分别启用或关闭。
+- 周报和月报中折线图使用飞书卡片 JSON 2.0 原生折线图，无需申请图片上传权限。
+- 暂仅支持飞书群自定义机器人 Webhook。
+
+### 配置
+
+复制配置文件：
+
+```bash
+cp config.example.json config.json
+```
+
+将 `config.json` 配置为：
 
 ```json
 {
@@ -21,11 +37,21 @@
     "password": "校园卡密码",
     "campus": "GZIC",
     "name": "宿舍余额",
-    "fetchInterval": "1d",
+    "fetchInterval": "4h",
+    "fetchJitterMinutes": 10,
     "notification": {
+      "enabledNotifications": ["daily", "lowBalance", "weeklyReport", "monthlyReport"],
       "hour": 8,
       "threshold": null,
-      "lines": "ewa",
+      "thresholds": {
+        "water": 20,
+        "electric": 15
+      },
+      "reports": {
+        "weekly": { "dayOfWeek": 1, "hour": 8, "minute": 5 },
+        "monthly": { "dayOfMonth": 1, "hour": 8, "minute": 10 }
+      },
+      "lines": "ew",
       "channel": {
         "type": "feishu",
         "name": "默认通知",
@@ -37,56 +63,47 @@
 }
 ```
 
-`campus` 可填国际校区 `GZIC` 或大学城校区 `DXC`；通知渠道 `type` 可填 `feishu` 或 `dingtalk`。`threshold` 为 `null` 时每天定时发送，设为数字时仅在所选余额低于该值时发送。`lines` 使用 `e`、`w`、`a` 分别表示电费、水费和空调费。
+主要字段：
 
-### QQ 模式
+- `campus`：国际校区使用 `GZIC`，大学城校区使用 `DXC`。
+- `encryptionKey`：用于加密敏感信息。可用 `openssl rand -base64 48` 生成，投入使用后不要修改。
+- `fetchInterval`：独立模式建议保持为 `4h`。
+- `fetchJitterMinutes`：为固定查询时隙增加偏移。设置为 `10` 时，每次在整点前后 1 至 10 分钟查询，不会恰好在整点访问。
+- `enabledNotifications`：只保留需要启用的通知类型；设置为 `[]` 可关闭所有通知。
+- `thresholds.water`、`thresholds.electric`：低余额阈值，设置为 `null` 表示不检查该项目。
+- `threshold`：旧版统一阈值的兼容字段；配置了分项阈值时优先使用 `thresholds`。
+- `lines`：独立模式固定使用 `ew`，分别表示电费和水费。
+- `channel.type`：独立模式只支持 `feishu`。
+- `channel.secret`：飞书机器人开启“签名校验”时填写；未开启时使用空字符串。
 
-将 `mode` 改为 `qq`，并配置：
+### 通知逻辑
 
-```json
-{
-  "mode": "qq",
-  "napcatWs": "ws://127.0.0.1:3001",
-  "napcatToken": "your_napcat_token",
-  "encryptionKey": "your_encryption_key",
-  "commandNames": ["scut-notipay", "snp"],
-  "billingRetryCount": 3
-}
-```
+`enabledNotifications` 支持以下值：
 
-`encryptionKey` 用于加密校园卡密码和通知渠道密钥。投入使用后不要修改，否则已有加密数据将无法解密。
+- `daily`：每天在 `notification.hour` 指定的整点读取最近一次采集结果并发送日报，不会额外查询校园卡网站。
+- `lowBalance`：一次采集完成后，电费或水费首次降到阈值时发送提醒。余额充值恢复后，再次跌破阈值会重新提醒。
+- `weeklyReport`：在 `reports.weekly` 指定的时间，统计此前完整七天。
+- `monthlyReport`：在 `reports.monthly` 指定的时间，统计上一个完整自然月。
 
-## Docker 部署
+### Docker 部署
 
-要求安装 Docker Engine 和 Docker Compose。先创建运行配置：
-
-```bash
-cp config.example.json config.json
-```
-
-QQ 模式下至少设置以下内容；独立模式不需要 NapCat：
-
-- `napcatToken`：NapCat WebSocket Token。
-- `encryptionKey`：不可泄露、不可随意更换的长随机字符串，可用 `openssl rand -base64 48` 生成。
-- `napcatWs`：NapCat WebSocket 地址。
-
-如果 NapCat 运行在 Docker 宿主机，Linux、macOS 和 Windows 均可使用 Compose 文件默认提供的宿主机映射：
-
-```json
-"napcatWs": "ws://host.docker.internal:3001"
-```
-
-如果 NapCat 也运行在同一个 Compose 网络中，应改用它的服务名，例如：
-
-```json
-"napcatWs": "ws://napcat:3001"
-```
-
-启动并查看日志：
+需要安装 Docker Engine 和 Docker Compose。完成 `config.json` 后启动服务：
 
 ```bash
 docker compose up -d --build
 docker compose logs -f scut-notipay
+```
+
+检查运行状态：
+
+```bash
+docker compose ps
+```
+
+更新代码后重新构建：
+
+```bash
+docker compose up -d --build
 ```
 
 停止服务：
@@ -95,7 +112,94 @@ docker compose logs -f scut-notipay
 docker compose down
 ```
 
-数据库存储在命名卷 `scut-notipay-data` 中，执行 `docker compose down` 不会删除数据。不要使用 `docker compose down -v`，除非确定要删除所有账号、账单历史和通知配置。
+数据库存储在命名卷 `scut-notipay-data` 中，执行 `docker compose down` 不会删除数据。不要使用 `docker compose down -v`，除非确定要删除账号、账单历史和通知状态。
+
+### 代理
+
+如需通过代理访问校园卡网站，在 `docker-compose.yml` 的 `environment` 中添加相应变量：
+
+```yaml
+environment:
+  TZ: Asia/Shanghai
+  DATA_PATH: /app/data/data.db
+  HTTP_PROXY: http://user:pass@proxy.example.com:8080
+  HTTPS_PROXY: http://user:pass@proxy.example.com:8080
+  # SOCKS5_PROXY: socks5://user:pass@proxy.example.com:1080
+```
+
+支持 `HTTP_PROXY`、`HTTPS_PROXY`、`SOCKS_PROXY` 和 `SOCKS5_PROXY`。同时配置时，SOCKS 代理优先于 HTTP 代理。修改 Compose 文件后需要重新创建容器：
+
+```bash
+docker compose up -d
+```
+
+## 提供服务模式
+
+这一部分我没有做测试，如果需要使用可以直接访问[原项目](https://github.com/Naptie/scut-notipay)。其实飞书创建应用机器人应该也能提供服务，且更为美观，但我没啥时间做，留给后来人。
+提供服务模式通过 NapCat WebSocket 接收 QQ 命令，适合为多个用户提供账号绑定、余额查询和定时通知服务。该模式暂只接入 QQ平台。
+
+### 功能
+
+- 在 QQ 私聊或群聊中绑定校园卡并查询余额。
+- 通过命令设置查询间隔和余额通知。
+- 支持电费、水费和空调费查询。
+- 只通过 QQ 私聊或群聊发送通知。
+- QQ 消息可以附带 PNG 趋势图。
+
+### 配置
+
+复制配置文件：
+
+```bash
+cp config.example.json config.json
+```
+
+将 `config.json` 的运行模式和 NapCat 配置修改为：
+
+```json
+{
+  "mode": "service",
+  "napcatWs": "ws://host.docker.internal:3001",
+  "napcatToken": "NapCat WebSocket Token",
+  "encryptionKey": "不可泄露且不可更换的长随机字符串",
+  "commandNames": ["scut-notipay", "snp"],
+  "billingRetryCount": 3
+}
+```
+
+主要字段：
+
+- `napcatWs`：NapCat WebSocket 地址。
+- `napcatToken`：NapCat WebSocket Token。
+- `encryptionKey`：用于加密校园卡密码。可用 `openssl rand -base64 48` 生成，投入使用后不要修改。
+- `commandNames`：QQ 中可使用的命令前缀。
+
+NapCat 运行在 Docker 宿主机时，Linux、macOS 和 Windows 均可使用 Compose 默认提供的宿主机映射：
+
+```json
+"napcatWs": "ws://host.docker.internal:3001"
+```
+
+NapCat 与本系统位于同一个 Compose 网络时，应改用 NapCat 的服务名：
+
+```json
+"napcatWs": "ws://napcat:3001"
+```
+
+### Docker 部署
+
+先确认 NapCat WebSocket 已启动，并且 Token 与 `config.json` 一致，然后启动本系统：
+
+```bash
+docker compose up -d --build
+docker compose logs -f scut-notipay
+```
+
+检查运行状态：
+
+```bash
+docker compose ps
+```
 
 更新代码后重新构建：
 
@@ -103,69 +207,51 @@ docker compose down
 docker compose up -d --build
 ```
 
-如需使用代理，可在 `docker-compose.yml` 的 `environment` 中加入 `HTTP_PROXY`、`HTTPS_PROXY`、`SOCKS_PROXY` 或 `SOCKS5_PROXY`。
-
-## 代理配置
-
-如果需要通过代理访问网络，可以设置以下环境变量：
-
-### HTTP/HTTPS 代理
+停止服务：
 
 ```bash
-# 支持基本认证的代理格式
-export HTTP_PROXY=http://username:password@proxy-host:port
-# 或
-export HTTPS_PROXY=http://username:password@proxy-host:port
+docker compose down
 ```
 
-**HTTP 代理 URL 格式示例：**
+数据库存储在命名卷 `scut-notipay-data` 中。不要使用 `docker compose down -v`，除非确定要删除所有已绑定账号、账单历史和通知配置。
 
-- 无认证：`http://proxy.example.com:8080`
-- 基本认证：`http://user:pass@proxy.example.com:8080`
+### 通知渠道
 
-### SOCKS5 代理
-
-```bash
-# 支持基本认证的 SOCKS5 代理格式
-export SOCKS_PROXY=socks5://username:password@proxy-host:port
-# 或
-export SOCKS5_PROXY=socks5://username:password@proxy-host:port
-```
-
-**SOCKS5 代理 URL 格式示例：**
-
-- 无认证：`socks5://proxy.example.com:1080`
-- 基本认证：`socks5://user:pass@proxy.example.com:1080`
-
-**注意：** SOCKS 代理优先级高于 HTTP 代理。如果同时设置了两种代理，将使用 SOCKS 代理。
-
-应用程序将自动检测并使用配置的代理进行所有 HTTP/HTTPS 请求。
-
-## 通知渠道
-
-系统支持 QQ、飞书和钉钉通知。QQ 通过 NapCat 发送；飞书和钉钉使用群自定义机器人 Webhook。飞书、钉钉渠道配置包含密钥，只能在 QQ 私聊中管理。
-
-钉钉机器人如果启用了“自定义关键词”安全设置，请确保关键词能被通知标题“宿舍余额提醒”或测试标题“SCUT Notipay 渠道测试”命中；也可以使用加签方式并在添加渠道时提供 `secret`。
+提供服务模式只支持 QQ 通知渠道。设置一次通知后，系统会自动建立当前私聊或群聊对应的 QQ 渠道，不需要手动添加渠道。
 
 ```text
-# 查看渠道（设置一次 QQ 通知后会自动建立当前会话的 QQ 渠道）
+# 查看渠道
 snp channel list
 
-# 添加飞书或钉钉渠道；未开启加签时省略最后的 secret
-snp channel add feishu 宿舍飞书群 https://open.feishu.cn/open-apis/bot/v2/hook/xxx [secret]
-snp channel add dingtalk 宿舍钉钉群 https://oapi.dingtalk.com/robot/send?access_token=xxx [secret]
-
-# 发送测试消息、删除非 QQ 渠道
-snp channel test <渠道ID>
-snp channel delete <渠道ID>
+# 测试 QQ 渠道
+snp channel test <QQ渠道ID>
 ```
 
-设置通知时用 `channels=` 选择一个或多个渠道；省略时默认发送到执行命令的 QQ 会话：
+设置通知时可以使用 `channels=` 选择一个或多个已有 QQ 渠道；省略时默认发送到执行命令的 QQ 会话：
 
 ```text
 snp notify 20 10 e channels=1,2,3
 ```
 
-以上命令表示每天 20:00 在电费低于 10 元时，通过渠道 1、2、3 发送通知。飞书和钉钉目前发送余额摘要卡片/Markdown；QQ 同时发送趋势图。
+以上命令表示每天 `20:00` 检查电费，余额低于 `10` 元时通过 QQ 渠道 `1`、`2`、`3` 发送通知。费用标识为：`e` 表示电费，`w` 表示水费，`a` 表示空调费。
 
-已有 QQ 通知会在程序首次启动新版本时自动迁移为 QQ 渠道，无需重新设置。Webhook 和签名 Secret 使用 `encryptionKey` 加密存储，请勿在群聊中发送这些配置。
+已有 QQ 通知会在程序首次启动新版本时自动迁移为 QQ 渠道，无需重新设置。历史数据库中遗留的非 QQ 渠道不会被提供服务模式加载或发送。
+
+### 代理
+
+如需使用代理，在 `docker-compose.yml` 的 `environment` 中添加：
+
+```yaml
+environment:
+  TZ: Asia/Shanghai
+  DATA_PATH: /app/data/data.db
+  HTTP_PROXY: http://user:pass@proxy.example.com:8080
+  HTTPS_PROXY: http://user:pass@proxy.example.com:8080
+  # SOCKS5_PROXY: socks5://user:pass@proxy.example.com:1080
+```
+
+支持的代理变量为 `HTTP_PROXY`、`HTTPS_PROXY`、`SOCKS_PROXY` 和 `SOCKS5_PROXY`，SOCKS 代理优先级更高。修改后重新创建容器：
+
+```bash
+docker compose up -d
+```

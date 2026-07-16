@@ -1,14 +1,16 @@
 import { execSync } from 'child_process';
+import { createHash } from 'crypto';
 import { NCWebsocket } from 'node-napcat-ts';
 import type { AllHandlers, SendMessageSegment } from 'node-napcat-ts';
 import config from '../config.json' with { type: 'json' };
 import { obtainToken as login } from './utils/session.js';
 import { getBills } from './utils/billing.js';
 import { db, scheduler, type Campus } from './utils/database.js';
+import type { NotificationThresholds } from './utils/scheduler.js';
 import { generateBillingCharts, generateBillingSummary } from './utils/presentation.js';
 import { APP_NAME, CAMPUSES, DATA_COLLECTION_BATCH_SIZE, GITHUB_LINK } from './utils/constants.js';
 import { NotificationService } from './notifications/service.js';
-import type { NotificationChannelType, WebhookChannelConfig } from './notifications/types.js';
+import type { WebhookChannelConfig } from './notifications/types.js';
 
 let commitHash: string;
 try {
@@ -71,6 +73,45 @@ const calculateNextFetchTime = (
   }
 
   return new Date(baseTime.getTime() + intervalHours * 60 * 60 * 1000);
+};
+
+type AlignedFetchSlot = { nominalTime: Date; targetTime: Date };
+
+const getAlignedFetchSlot = (
+  now: Date,
+  baseTime: Date,
+  intervalHours: number,
+  jitterMinutes: number,
+  key: string
+): AlignedFetchSlot | null => {
+  if (
+    intervalHours < 1 ||
+    intervalHours > 24 ||
+    24 % intervalHours !== 0 ||
+    !Number.isInteger(jitterMinutes) ||
+    jitterMinutes < 1
+  )
+    return null;
+
+  const dayStart = new Date(now);
+  dayStart.setHours(0, 0, 0, 0);
+  const slotsPerDay = 24 / intervalHours;
+  let latest: AlignedFetchSlot | null = null;
+
+  for (let slot = -1; slot <= slotsPerDay; slot += 1) {
+    const nominalTime = new Date(dayStart.getTime() + slot * intervalHours * 60 * 60 * 1000);
+    const digest = createHash('sha256').update(`${key}:${nominalTime.toISOString()}`).digest();
+    const choice = digest.readUInt32BE(0) % (jitterMinutes * 2);
+    const offsetMinutes =
+      choice < jitterMinutes ? choice - jitterMinutes : choice - jitterMinutes + 1;
+    const targetTime = new Date(nominalTime.getTime() + offsetMinutes * 60 * 1000);
+
+    if (targetTime <= now && targetTime > baseTime && (!latest || targetTime > latest.targetTime)) {
+      latest = { nominalTime, targetTime };
+    }
+  }
+
+  return latest;
 };
 
 /**
@@ -279,9 +320,80 @@ const napcat = new NCWebsocket(
   false
 );
 
-const notificationService = new NotificationService(napcat);
+type RuntimeMode = 'standalone' | 'service';
 
-const isStandalone = config.mode === 'standalone';
+const resolveRuntimeMode = (mode: string): RuntimeMode => {
+  if (mode === 'standalone' || mode === 'service') return mode;
+  if (mode === 'qq') {
+    console.warn('[Config] mode "qq" 已更名为 "service"，请更新 config.json。');
+    return 'service';
+  }
+  throw new Error('mode 必须是 standalone 或 service');
+};
+
+const runtimeMode = resolveRuntimeMode(config.mode);
+const isStandalone = runtimeMode === 'standalone';
+const notificationService = new NotificationService(napcat, runtimeMode);
+
+type StandaloneNotificationKind = 'daily' | 'lowBalance' | 'weeklyReport' | 'monthlyReport';
+
+const getEnabledStandaloneNotifications = (): StandaloneNotificationKind[] => {
+  const notification = config.standalone?.notification as
+    | { enabledNotifications?: unknown }
+    | undefined;
+  const enabled = notification?.enabledNotifications;
+  if (enabled === undefined) return ['daily', 'lowBalance'];
+  if (
+    !Array.isArray(enabled) ||
+    enabled.some(
+      (value) =>
+        value !== 'daily' &&
+        value !== 'lowBalance' &&
+        value !== 'weeklyReport' &&
+        value !== 'monthlyReport'
+    )
+  ) {
+    throw new Error('standalone.notification.enabledNotifications 包含不支持的通知类型');
+  }
+  return [...new Set(enabled)] as StandaloneNotificationKind[];
+};
+
+type ReportScheduleConfig = {
+  weekly: { dayOfWeek: number; hour: number; minute: number };
+  monthly: { dayOfMonth: number; hour: number; minute: number };
+};
+
+const getStandaloneReportSchedule = (): ReportScheduleConfig => {
+  const configured = (
+    config.standalone?.notification as unknown as { reports?: Partial<ReportScheduleConfig> }
+  )?.reports;
+  const schedule: ReportScheduleConfig = {
+    weekly: { dayOfWeek: 1, hour: 8, minute: 5, ...configured?.weekly },
+    monthly: { dayOfMonth: 1, hour: 8, minute: 10, ...configured?.monthly }
+  };
+  const validTime = (value: { hour: number; minute: number }) =>
+    Number.isInteger(value.hour) &&
+    value.hour >= 0 &&
+    value.hour <= 23 &&
+    Number.isInteger(value.minute) &&
+    value.minute >= 0 &&
+    value.minute <= 59;
+  if (
+    !validTime(schedule.weekly) ||
+    !Number.isInteger(schedule.weekly.dayOfWeek) ||
+    schedule.weekly.dayOfWeek < 0 ||
+    schedule.weekly.dayOfWeek > 6
+  )
+    throw new Error('standalone.notification.reports.weekly 配置无效');
+  if (
+    !validTime(schedule.monthly) ||
+    !Number.isInteger(schedule.monthly.dayOfMonth) ||
+    schedule.monthly.dayOfMonth < 1 ||
+    schedule.monthly.dayOfMonth > 28
+  )
+    throw new Error('standalone.notification.reports.monthly 配置无效');
+  return schedule;
+};
 
 const configureStandaloneMode = () => {
   const standalone = config.standalone;
@@ -312,28 +424,33 @@ const configureStandaloneMode = () => {
     console.log('[Standalone] 未配置通知，仅定时采集数据。');
     return;
   }
+  getEnabledStandaloneNotifications();
+  getStandaloneReportSchedule();
   const channelConfig = notification.channel;
-  if (!channelConfig || !['feishu', 'dingtalk'].includes(channelConfig.type)) {
-    throw new Error('standalone.notification.channel.type 必须是 feishu 或 dingtalk');
+  if (!channelConfig || channelConfig.type !== 'feishu') {
+    throw new Error('standalone.notification.channel.type 仅支持 feishu');
   }
+  const channelType = 'feishu' as const;
   const webhookConfig: WebhookChannelConfig = {
     webhookUrl: channelConfig.webhookUrl,
     ...(channelConfig.secret ? { secret: channelConfig.secret } : {})
   };
-  notificationService.validate({ type: channelConfig.type, config: webhookConfig });
+  notificationService.validate({ type: channelType, config: webhookConfig });
   const channel = scheduler.upsertChannel(
     ownerId,
-    channelConfig.type,
+    channelType,
     channelConfig.name || '默认通知',
     webhookConfig
   );
+  const thresholds = (notification as { thresholds?: NotificationThresholds }).thresholds;
   const rule = scheduler.setNotification(
     'private',
     ownerId,
     ownerId,
     notification.hour,
     notification.threshold ?? undefined,
-    notification.lines || 'ewa'
+    notification.lines || 'ewa',
+    thresholds
   );
   scheduler.setNotificationChannels(rule.id!, ownerId, [channel.id]);
   console.log(`[Standalone] 配置已加载，通知时间为每天 ${notification.hour}:00。`);
@@ -387,6 +504,7 @@ const parseMessage = (context: AllHandlers['message']) => {
 // Combined timer for data collection and notifications
 let hourlyTimeout: NodeJS.Timeout | null = null;
 let hourlyInterval: NodeJS.Timeout | null = null;
+const lastFetchAttemptBySlot = new Map<string, number>();
 
 /**
  * Type for collected student billing data
@@ -401,6 +519,21 @@ type CollectedData = {
   success: boolean;
   error?: Error;
 };
+
+type FeishuTextColor = 'red' | 'green' | 'grey' | 'orange' | 'blue' | 'purple';
+
+const escapeMarkdown = (value: string): string => value.replace(/([\\`*_[\]<>#])/g, '\\$1');
+
+const richAmount = (value: number, color: FeishuTextColor): string =>
+  `<font color='${color}'>**${value.toFixed(2)} 元**</font>`;
+
+const richChange = (value: number): string => {
+  const color: FeishuTextColor = value < 0 ? 'red' : value > 0 ? 'green' : 'grey';
+  const formatted = `${value > 0 ? '+' : ''}${value.toFixed(2)} 元`;
+  return `<font color='${color}'>**${formatted}**</font>`;
+};
+
+const richRoom = (room: string): string => `🏠 **宿舍**\u3000\`${escapeMarkdown(room)}\``;
 
 /**
  * Collect billing data for a single student
@@ -491,7 +624,8 @@ const collectData = async (
  */
 const sendNotificationForStudent = async (
   collectedData: CollectedData,
-  currentHour: number
+  currentHour: number,
+  mode: 'daily' | 'threshold'
 ): Promise<void> => {
   if (!collectedData.success) {
     console.log(
@@ -501,32 +635,84 @@ const sendNotificationForStudent = async (
   }
 
   const { qqId, name, electric, water, ac, room } = collectedData;
-  const notifications = scheduler.getNotificationsAtHourForUser(qqId, currentHour);
+  const standaloneOwnerId = `standalone:${config.standalone?.id || 'default'}`;
+  if (isStandalone && qqId === standaloneOwnerId) {
+    const kind: StandaloneNotificationKind = mode === 'daily' ? 'daily' : 'lowBalance';
+    if (!getEnabledStandaloneNotifications().includes(kind)) return;
+  }
+  const notifications =
+    mode === 'daily'
+      ? scheduler.getNotificationsAtHourForUser(qqId, currentHour)
+      : scheduler.getNotificationsForUser(qqId);
 
   for (const notification of notifications) {
     try {
-      // Check if threshold is set and if any balance is below it
-      let shouldSendNotification = true;
-      const lines = notification.lines || 'ewa';
+      const configuredLines = notification.lines || 'ewa';
+      const lines =
+        isStandalone && qqId === standaloneOwnerId
+          ? configuredLines.replace(/a/gi, '')
+          : configuredLines;
+      let thresholdState: { electric: boolean; water: boolean; ac: boolean } | null = null;
+      let thresholdCondition = '';
 
-      if (notification.threshold !== null && notification.threshold !== undefined) {
-        // Only send if any balance drops below the threshold
-        const threshold = notification.threshold;
-        shouldSendNotification = false;
+      if (mode === 'daily') {
+        if (notification.last_sent) {
+          const lastSent = new Date(notification.last_sent);
+          const now = new Date();
+          if (
+            lastSent.getFullYear() === now.getFullYear() &&
+            lastSent.getMonth() === now.getMonth() &&
+            lastSent.getDate() === now.getDate()
+          )
+            continue;
+        }
+      } else {
+        const fallback = notification.threshold;
+        const electricThreshold = notification.electric_threshold ?? fallback;
+        const waterThreshold = notification.water_threshold ?? fallback;
+        const acThreshold = notification.ac_threshold ?? fallback;
+        const hasThreshold =
+          (lines.toLowerCase().includes('e') && electricThreshold != null) ||
+          (lines.toLowerCase().includes('w') && waterThreshold != null) ||
+          (lines.toLowerCase().includes('a') && acThreshold != null);
+        if (!hasThreshold) continue;
 
-        if (lines.toLowerCase().includes('e') && electric >= -10 && electric < threshold)
-          shouldSendNotification = true;
-        if (lines.toLowerCase().includes('w') && water >= -10 && water < threshold)
-          shouldSendNotification = true;
-        if (lines.toLowerCase().includes('a') && ac >= -10 && ac < threshold)
-          shouldSendNotification = true;
-
-        if (!shouldSendNotification) {
+        thresholdState = {
+          electric:
+            lines.toLowerCase().includes('e') &&
+            electricThreshold !== null &&
+            electricThreshold !== undefined &&
+            electric >= -10 &&
+            electric <= electricThreshold,
+          water:
+            lines.toLowerCase().includes('w') &&
+            waterThreshold !== null &&
+            waterThreshold !== undefined &&
+            water >= -10 &&
+            water <= waterThreshold,
+          ac:
+            lines.toLowerCase().includes('a') &&
+            acThreshold !== null &&
+            acThreshold !== undefined &&
+            ac >= -10 &&
+            ac <= acThreshold
+        };
+        const conditions: string[] = [];
+        if (thresholdState.electric) conditions.push(`电费 ≤ ${electricThreshold} 元`);
+        if (thresholdState.water) conditions.push(`水费 ≤ ${waterThreshold} 元`);
+        if (thresholdState.ac) conditions.push(`空调费 ≤ ${acThreshold} 元`);
+        if (conditions.length > 0) thresholdCondition = `（${conditions.join('、')}）`;
+        const newlyBelow =
+          (thresholdState.electric && notification.electric_alerted !== 1) ||
+          (thresholdState.water && notification.water_alerted !== 1) ||
+          (thresholdState.ac && notification.ac_alerted !== 1);
+        if (!newlyBelow) {
+          scheduler.updateThresholdAlertState(notification.id!, thresholdState);
           continue;
         }
       }
 
-      console.log(`[Scheduler] Sending notification to ${name || qqId} (${room})`);
+      console.log(`[Scheduler] Sending ${mode} notification to ${name || qqId} (${room})`);
 
       // Get 24h change
       const change24h = db.getBilling24HourChange(qqId);
@@ -534,14 +720,57 @@ const sendNotificationForStudent = async (
       // Get history for chart
       const history = db.getBillingHistory(qqId, 7);
 
-      // Generate summary
-      let messageText = `🏠 ${room}\n\n`;
-      messageText += generateBillingSummary({ electric, water, ac }, change24h || undefined);
+      const changes = change24h || { electric: 0, water: 0, ac: 0 };
+      const formatChange = (value: number) => `${value > 0 ? '+' : ''}${value.toFixed(2)}`;
+      let messageText = `宿舍: ${room}\n\n`;
+      if (mode === 'daily') {
+        messageText += '当前余额:\n';
+        messageText += `⚡ 电费：${electric.toFixed(2)} 元\n`;
+        messageText += `💧 水费：${water.toFixed(2)} 元\n\n`;
+        messageText += '最近 24 小时:\n';
+        messageText += `⚡ 电费：${formatChange(changes.electric)} 元\n`;
+        messageText += `💧 水费：${formatChange(changes.water)} 元\n`;
+      } else {
+        messageText += `⚠️ 余额已达到提醒阈值${thresholdCondition}\n\n`;
+        messageText += '当前余额：\n';
+        messageText += `⚡ 电费：${electric.toFixed(2)} 元\n`;
+        messageText += `💧 水费：${water.toFixed(2)} 元\n\n`;
+        messageText += '最近 24 小时：\n';
+        messageText += `⚡ 电费：${formatChange(changes.electric)} 元\n`;
+        messageText += `💧 水费：${formatChange(changes.water)} 元\n`;
+      }
+
+      const thresholdDescription = thresholdCondition || '（已配置阈值）';
+      const messageMarkdown =
+        mode === 'daily'
+          ? [
+              richRoom(room),
+              '<hr>',
+              '### 当前余额',
+              `⚡ **电费**\u3000${richAmount(electric, 'orange')}`,
+              `💧 **水费**\u3000${richAmount(water, 'blue')}`,
+              '<hr>',
+              '### 最近 24 小时',
+              `⚡ **电费变化**\u3000${richChange(changes.electric)}`,
+              `💧 **水费变化**\u3000${richChange(changes.water)}`
+            ].join('\n\n')
+          : [
+              richRoom(room),
+              `> <font color='red'>**⚠️ 余额已达到提醒阈值**</font><br>> ${thresholdDescription}`,
+              '<hr>',
+              '### 当前余额',
+              `⚡ **电费**\u3000${richAmount(electric, thresholdState?.electric ? 'red' : 'orange')}`,
+              `💧 **水费**\u3000${richAmount(water, thresholdState?.water ? 'red' : 'blue')}`,
+              '<hr>',
+              '### 最近 24 小时',
+              `⚡ **电费变化**\u3000${richChange(changes.electric)}`,
+              `💧 **水费变化**\u3000${richChange(changes.water)}`
+            ].join('\n\n');
 
       const chartImages: Array<{ filename: string; buffer: Buffer }> = [];
 
-      // Add chart images
-      if (history.length >= 2) {
+      // Service mode keeps QQ PNG charts. Standalone Feishu daily and alerts are text-only.
+      if (!isStandalone && history.length >= 2) {
         const chartData = history.reverse().map((h) => ({
           timestamp: h.recorded_at,
           electric: h.electric,
@@ -549,26 +778,41 @@ const sendNotificationForStudent = async (
           ac: h.ac
         }));
 
-        const charts = await generateBillingCharts(chartData, room, lines);
+        const charts = await generateBillingCharts(
+          chartData,
+          room,
+          mode === 'daily' ? 'ew' : lines
+        );
         for (const [index, chart] of charts.entries()) {
           chartImages.push({ filename: `billing-${index + 1}.png`, buffer: chart.buffer });
         }
       }
 
-      const channels = scheduler.getChannelsForNotification(notification.id!, qqId);
+      const channels = scheduler
+        .getChannelsForNotification(notification.id!, qqId)
+        .filter((channel) => channel.type === (isStandalone ? 'feishu' : 'qq'));
       const payload = {
-        title: `宿舍余额提醒 · ${room}`,
+        title: `${mode === 'daily' ? '宿舍余额日报' : '宿舍余额不足提醒'} · ${room}`,
         text: messageText,
-        markdown: messageText.replace(/\n/g, '\n\n'),
-        images: chartImages
+        markdown: messageMarkdown,
+        images: chartImages,
+        theme: mode === 'daily' ? ('blue' as const) : ('red' as const)
       };
+      let sent = false;
       for (const channel of channels) {
         try {
           await notificationService.send(channel, payload);
-          console.log(`[Scheduler] Sent notification through ${channel.type} channel ${channel.id}`);
+          sent = true;
+          console.log(
+            `[Scheduler] Sent notification through ${channel.type} channel ${channel.id}`
+          );
         } catch (error) {
           console.error(`[Scheduler] Failed channel ${channel.id} (${channel.type}):`, error);
         }
+      }
+      if (sent && mode === 'daily') scheduler.updateLastSent(notification.id!);
+      if (sent && mode === 'threshold' && thresholdState) {
+        scheduler.updateThresholdAlertState(notification.id!, thresholdState);
       }
     } catch (error) {
       console.error(
@@ -579,54 +823,264 @@ const sendNotificationForStudent = async (
   }
 };
 
+type ReportType = 'weekly' | 'monthly';
+
+const formatDate = (value: Date): string =>
+  `${value.getFullYear()}-${String(value.getMonth() + 1).padStart(2, '0')}-${String(value.getDate()).padStart(2, '0')}`;
+
+const makeSparkline = (values: number[]): string => {
+  const valid = values.filter((value) => Number.isFinite(value) && value >= -10);
+  if (valid.length === 0) return '无数据';
+  const sampled =
+    valid.length <= 24
+      ? valid
+      : Array.from(
+          { length: 24 },
+          (_, index) => valid[Math.floor((index * (valid.length - 1)) / 23)]
+        );
+  const min = Math.min(...sampled);
+  const max = Math.max(...sampled);
+  const blocks = '▁▂▃▄▅▆▇█';
+  if (max === min) return sampled.map(() => blocks[3]).join('');
+  return sampled
+    .map((value) => blocks[Math.round(((value - min) / (max - min)) * (blocks.length - 1))])
+    .join('');
+};
+
+const calculatePeriodUsage = (values: number[]): number => {
+  const valid = values.filter((value) => Number.isFinite(value) && value >= -10);
+  let usage = 0;
+  for (let index = 1; index < valid.length; index += 1) {
+    usage += Math.max(valid[index - 1] - valid[index], 0);
+  }
+  return usage;
+};
+
+const sendReport = async (
+  qqId: string,
+  type: ReportType,
+  start: Date,
+  end: Date
+): Promise<void> => {
+  const periodKey = `${formatDate(start)}_${formatDate(end)}`;
+  if (scheduler.hasReportDelivery(qqId, type, periodKey)) return;
+
+  const records = db.getBillingHistoryForReport(qqId, start, end);
+  const periodRecords = records.filter((record) => new Date(record.recorded_at) >= start);
+  if (periodRecords.length === 0) {
+    console.log(`[Report] No ${type} data for ${qqId} in ${periodKey}`);
+    return;
+  }
+
+  const electricValues = records.map((record) => record.electric);
+  const waterValues = records.map((record) => record.water);
+  const electricUsage = calculatePeriodUsage(electricValues);
+  const waterUsage = calculatePeriodUsage(waterValues);
+  const latest = records.at(-1)!;
+  const first = records[0];
+  const endDisplay = new Date(end.getTime() - 24 * 60 * 60 * 1000);
+  const reportName = type === 'weekly' ? '宿舍余额周报' : '宿舍余额月报';
+  const periodName = type === 'weekly' ? '本周使用' : '本月使用';
+  const chartData = records.map((record) => ({
+    timestamp: record.recorded_at,
+    electric: record.electric,
+    water: record.water,
+    ac: record.ac
+  }));
+  const chartPoints = chartData
+    .map(({ timestamp, electric, water }) => ({ timestamp, electric, water }))
+    .filter(
+      ({ timestamp, electric, water }) =>
+        !Number.isNaN(new Date(timestamp).getTime()) &&
+        Number.isFinite(electric) &&
+        Number.isFinite(water)
+    );
+  const uniqueChartTimestamps = new Set(
+    chartPoints.map(({ timestamp }) => new Date(timestamp).getTime())
+  );
+  const hasEnoughChartData = uniqueChartTimestamps.size >= 2;
+  const electricSparkline = makeSparkline(electricValues);
+  const waterSparkline = makeSparkline(waterValues);
+  let message = `宿舍: ${latest.room || ''}\n\n`;
+  message += `📅 ${formatDate(start)} 至 ${formatDate(endDisplay)}\n\n`;
+  message += `⚡ ${periodName}电费：${electricUsage.toFixed(2)} 元\n`;
+  message += `💧 ${periodName}水费：${waterUsage.toFixed(2)} 元\n\n`;
+  message += `⚡ 电费余额：${first.electric.toFixed(2)} → ${latest.electric.toFixed(2)} 元\n`;
+  if (!hasEnoughChartData) message += `   ${electricSparkline}\n`;
+  message += `💧 水费余额：${first.water.toFixed(2)} → ${latest.water.toFixed(2)} 元\n`;
+  if (!hasEnoughChartData) message += `   ${waterSparkline}\n`;
+  if (!hasEnoughChartData) {
+    message += '\n📈 趋势图：历史数据不足，至少需要 2 个有效采样点。\n';
+    console.warn(
+      `[Report] Skipping ${type} chart for ${qqId}: only ${uniqueChartTimestamps.size} valid sample(s)`
+    );
+  }
+  const periodLabel = type === 'weekly' ? '本周' : '本月';
+  const reportMarkdown = [
+    richRoom(latest.room || ''),
+    `📅 **统计周期**\u3000\`${formatDate(start)}\` → \`${formatDate(endDisplay)}\``,
+    '<hr>',
+    `### ${periodLabel}用量`,
+    `⚡ **电费**\u3000${richAmount(electricUsage, 'orange')}`,
+    `💧 **水费**\u3000${richAmount(waterUsage, 'blue')}`,
+    '<hr>',
+    '### 余额变化',
+    `⚡ **电费**\u3000\`${first.electric.toFixed(2)}\` → ${richAmount(latest.electric, 'orange')}`,
+    ...(!hasEnoughChartData ? [`<font color='grey'>趋势\u3000${electricSparkline}</font>`] : []),
+    `💧 **水费**\u3000\`${first.water.toFixed(2)}\` → ${richAmount(latest.water, 'blue')}`,
+    ...(!hasEnoughChartData ? [`<font color='grey'>趋势\u3000${waterSparkline}</font>`] : []),
+    ...(hasEnoughChartData
+      ? []
+      : ["<font color='grey'>📈 历史数据不足，至少需要 2 个有效采样点才能绘制折线图。</font>"])
+  ].join('\n\n');
+  const rules = scheduler.getNotificationsForUser(qqId);
+  const channels = [
+    ...new Map(
+      rules
+        .flatMap((rule) => scheduler.getChannelsForNotification(rule.id!, qqId))
+        .map((channel) => [channel.id, channel] as const)
+    ).values()
+  ].filter((channel) => channel.type === 'feishu');
+  let sent = false;
+  for (const channel of channels) {
+    try {
+      await notificationService.send(channel, {
+        title: `${reportName} · ${latest.room || ''}`,
+        text: message,
+        markdown: reportMarkdown,
+        images: [],
+        charts: hasEnoughChartData
+          ? [
+              {
+                title: `${latest.room || ''} 电费与水费余额趋势`,
+                points: chartPoints
+              }
+            ]
+          : [],
+        theme: type === 'weekly' ? 'green' : 'purple'
+      });
+      sent = true;
+    } catch (error) {
+      console.error(`[Report] Failed ${type} report through channel ${channel.id}:`, error);
+    }
+  }
+  if (sent) {
+    scheduler.recordReportDelivery(qqId, type, periodKey);
+    console.log(`[Report] Sent ${type} report for ${qqId}: ${periodKey}`);
+  }
+};
+
+const sendDueReports = async (now: Date): Promise<void> => {
+  if (!isStandalone) return;
+  const enabled = getEnabledStandaloneNotifications();
+  const schedule = getStandaloneReportSchedule();
+  const ownerId = `standalone:${config.standalone?.id || 'default'}`;
+
+  if (
+    enabled.includes('weeklyReport') &&
+    now.getDay() === schedule.weekly.dayOfWeek &&
+    now.getHours() === schedule.weekly.hour &&
+    now.getMinutes() === schedule.weekly.minute
+  ) {
+    const end = new Date(now);
+    end.setHours(0, 0, 0, 0);
+    const start = new Date(end);
+    start.setDate(start.getDate() - 7);
+    await sendReport(ownerId, 'weekly', start, end);
+  }
+
+  if (
+    enabled.includes('monthlyReport') &&
+    now.getDate() === schedule.monthly.dayOfMonth &&
+    now.getHours() === schedule.monthly.hour &&
+    now.getMinutes() === schedule.monthly.minute
+  ) {
+    const end = new Date(now.getFullYear(), now.getMonth(), 1);
+    const start = new Date(now.getFullYear(), now.getMonth() - 1, 1);
+    await sendReport(ownerId, 'monthly', start, end);
+  }
+};
+
 const runHourlyTasks = async () => {
   try {
     const now = new Date();
-    const minutes = now.getMinutes();
-    const currentHour = minutes >= 30 ? (now.getHours() + 1) % 24 : now.getHours();
-    console.log(`[Scheduler] Running for hour: ${currentHour}`);
+    const currentHour = now.getHours();
 
     // Get all students with their notification settings
     const allStudents = db.getAllStudents();
-    console.log(`[Scheduler] Checking ${allStudents.length} students`);
 
     if (allStudents.length === 0) {
-      console.log('[Scheduler] No students to process');
       return;
     }
 
+    await sendDueReports(now);
+
     const studentsToFetch: typeof allStudents = [];
+    const standalone = config.standalone as typeof config.standalone & {
+      fetchJitterMinutes?: number;
+    };
+    const standaloneOwnerId = `standalone:${standalone?.id || 'default'}`;
+
+    // Daily notifications use the latest stored record and never trigger a website query.
+    if (now.getMinutes() === 0) {
+      for (const student of allStudents) {
+        const latest = db.getLatestBilling(student.qq_id);
+        if (!latest) continue;
+        await sendNotificationForStudent(
+          {
+            qqId: student.qq_id,
+            name: student.name,
+            electric: latest.electric,
+            water: latest.water,
+            ac: latest.ac,
+            room: latest.room || '',
+            success: true
+          },
+          currentHour,
+          'daily'
+        );
+      }
+    }
 
     for (const student of allStudents) {
       let shouldFetch = false;
+      const intervalHours = parseRelativeTime(student.fetch_interval || '1d');
+      const isJitteredStandalone =
+        isStandalone &&
+        student.qq_id === standaloneOwnerId &&
+        Number.isInteger(standalone.fetchJitterMinutes) &&
+        (standalone.fetchJitterMinutes || 0) > 0;
 
-      // Phase 0 (a): Check notifications
-      const notifications = scheduler.getNotificationsAtHourForUser(student.qq_id, currentHour);
-      if (notifications.length > 0) {
-        shouldFetch = true;
-        console.log(`[Scheduler] Fetching for ${student.qq_id} due to scheduled notification`);
-      }
-
-      // Phase 0 (b): Check fetch interval
-      if (!shouldFetch) {
-        try {
-          const intervalHours = parseRelativeTime(student.fetch_interval || '1d');
-          const nextFetchTime = calculateNextFetchTime(
-            student.last_login,
-            student.created_at,
-            intervalHours
+      if (isJitteredStandalone) {
+        const baseTime = new Date(student.last_login || student.created_at);
+        const slot = getAlignedFetchSlot(
+          now,
+          baseTime,
+          intervalHours,
+          standalone.fetchJitterMinutes!,
+          student.qq_id
+        );
+        if (slot && lastFetchAttemptBySlot.get(student.qq_id) !== slot.targetTime.getTime()) {
+          shouldFetch = true;
+          lastFetchAttemptBySlot.set(student.qq_id, slot.targetTime.getTime());
+          console.log(
+            `[Scheduler] Fetching for ${student.qq_id} in ${slot.nominalTime.getHours()}:00 slot ` +
+              `(scheduled ${slot.targetTime.toLocaleString()})`
           );
+        }
+      } else if (now.getMinutes() === 0) {
+        // Non-jittered accounts keep the original hourly scheduling behavior.
+        const nextFetchTime = calculateNextFetchTime(
+          student.last_login,
+          student.created_at,
+          intervalHours
+        );
 
-          // Check if current time is at or after the scheduled fetch time
-          // We use a small buffer (5 mins) to handle slight timing differences
-          if (now.getTime() >= nextFetchTime.getTime() - 5 * 60 * 1000) {
-            shouldFetch = true;
-            console.log(
-              `[Scheduler] Fetching for ${student.qq_id} due to interval (Next: ${nextFetchTime.toLocaleString()}, Interval: ${student.fetch_interval})`
-            );
-          }
-        } catch (e) {
-          console.error(`[Scheduler] Error checking interval for ${student.qq_id}:`, e);
+        if (now.getTime() >= nextFetchTime.getTime() - 5 * 60 * 1000) {
+          shouldFetch = true;
+          console.log(
+            `[Scheduler] Fetching for ${student.qq_id} due to interval (Next: ${nextFetchTime.toLocaleString()}, Interval: ${student.fetch_interval})`
+          );
         }
       }
 
@@ -636,7 +1090,6 @@ const runHourlyTasks = async () => {
     }
 
     if (studentsToFetch.length === 0) {
-      console.log('[Scheduler] No students need fetching this hour');
       return;
     }
 
@@ -652,14 +1105,14 @@ const runHourlyTasks = async () => {
     );
 
     // Phase 2: Send notifications serially
-    console.log('[Scheduler] Phase 2: Sending notifications...');
+    console.log('[Scheduler] Phase 2: Checking low-balance thresholds...');
     for (const data of collectedData) {
-      await sendNotificationForStudent(data, currentHour);
+      await sendNotificationForStudent(data, currentHour, 'threshold');
     }
 
-    console.log('[Scheduler] Hourly tasks completed');
+    console.log('[Scheduler] Scheduled tasks completed');
   } catch (error) {
-    console.error('[Scheduler] Error during hourly tasks:', error);
+    console.error('[Scheduler] Error during scheduled tasks:', error);
   }
 };
 
@@ -667,28 +1120,20 @@ const startHourlyTimer = () => {
   // Clear any existing timers to prevent duplicates on reconnection
   stopHourlyTimer();
 
-  // Calculate delay until next top of the hour
+  // Calculate delay until the next minute boundary.
   const now = new Date();
-  const minutes = now.getMinutes();
   const seconds = now.getSeconds();
   const milliseconds = now.getMilliseconds();
+  const delayUntilNextMinute = (60 - seconds) * 1000 - milliseconds;
 
-  // Time until next hour (in milliseconds)
-  const delayUntilNextHour = (60 - minutes - 1) * 60 * 1000 + (60 - seconds) * 1000 - milliseconds;
+  console.log('[Scheduler] Minute scheduler enabled');
 
-  console.log(
-    `[Scheduler] Will start in ${Math.round(delayUntilNextHour / 1000 / 60)} minutes (at next hour)`
-  );
-
-  // Schedule first run at the top of the next hour
   hourlyTimeout = setTimeout(() => {
-    runHourlyTasks();
+    void runHourlyTasks();
 
-    // Then run every hour on the hour
-    hourlyInterval = setInterval(runHourlyTasks, 60 * 60 * 1000);
+    hourlyInterval = setInterval(() => void runHourlyTasks(), 60 * 1000);
     hourlyTimeout = null;
-    console.log('[Scheduler] Timer started (runs every hour on the hour)');
-  }, delayUntilNextHour);
+  }, delayUntilNextMinute);
 };
 
 const stopHourlyTimer = () => {
@@ -748,7 +1193,10 @@ const handleNotifyCommand = async (
         message += ` [${notification.lines.toUpperCase()}]`;
       }
       const channelNames = notification.id
-        ? scheduler.getChannelsForNotification(notification.id, qqId).map((channel) => channel.name)
+        ? scheduler
+            .getChannelsForNotification(notification.id, qqId)
+            .filter((channel) => channel.type === 'qq')
+            .map((channel) => channel.name)
         : [];
       message += ` → ${channelNames.join('、') || '未选择渠道'}`;
     }
@@ -800,8 +1248,8 @@ const handleNotifyCommand = async (
   }
 
   const selectedChannels = channelIds ?? [scheduler.ensureQQChannel(qqId, chatType, chatId).id];
-  if (selectedChannels.some((id) => !scheduler.getChannel(id, qqId))) {
-    await sendFn('包含无效或不属于您的通知渠道，请先执行 channel list。');
+  if (selectedChannels.some((id) => scheduler.getChannel(id, qqId)?.type !== 'qq')) {
+    await sendFn('提供服务模式仅支持 QQ 通知渠道，请先执行 channel list。');
     return;
   }
 
@@ -828,12 +1276,11 @@ const handleNotifyCommand = async (
 const handleChannelCommand = async (
   params: string[],
   qqId: string,
-  isPrivateChat: boolean,
   sendFn: (message: string) => Promise<void>
 ) => {
   const action = params[0]?.toLowerCase();
   if (!action || action === 'list') {
-    const channels = scheduler.getChannelsForUser(qqId);
+    const channels = scheduler.getChannelsForUser(qqId).filter((channel) => channel.type === 'qq');
     if (channels.length === 0) {
       await sendFn('暂无通知渠道。设置一次 QQ 通知后会自动创建 QQ 渠道。');
       return;
@@ -841,60 +1288,29 @@ const handleChannelCommand = async (
     await sendFn(
       '通知渠道：\n' +
         channels
-          .map((channel) => `- ${channel.id}: ${channel.name} [${channel.type}]${channel.enabled ? '' : '（停用）'}`)
+          .map(
+            (channel) =>
+              `- ${channel.id}: ${channel.name} [${channel.type}]${channel.enabled ? '' : '（停用）'}`
+          )
           .join('\n')
     );
     return;
   }
 
-  if (!isPrivateChat) {
-    await sendFn('渠道配置可能包含密钥，请仅在 QQ 私聊中操作。');
-    return;
-  }
-  if (!db.getCredentials(qqId)) {
-    await sendFn('请先绑定校园卡账号。');
-    return;
-  }
-
   if (action === 'add') {
-    const type = params[1]?.toLowerCase() as NotificationChannelType;
-    const name = params[2];
-    const webhookUrl = params[3];
-    const secret = params[4];
-    if (!['feishu', 'dingtalk'].includes(type) || !name || !webhookUrl || params.length > 5) {
-      await sendFn('用法：channel add <feishu|dingtalk> <名称> <webhook> [secret]');
-      return;
-    }
-    try {
-      const channelConfig: WebhookChannelConfig = {
-        webhookUrl,
-        ...(secret ? { secret } : {})
-      };
-      notificationService.validate({ type, config: channelConfig });
-      const channel = scheduler.addChannel(
-        qqId,
-        type as 'feishu' | 'dingtalk',
-        name,
-        channelConfig
-      );
-      await sendFn(
-        `已添加渠道 ${channel.id}: ${channel.name} [${channel.type}]。请执行 channel test ${channel.id} 测试。`
-      );
-    } catch (error) {
-      await sendFn(`添加失败：${error instanceof Error ? error.message : String(error)}`);
-    }
+    await sendFn('提供服务模式仅支持 QQ 通知渠道；设置通知时会自动创建对应渠道。');
     return;
   }
 
   const id = Number(params[1]);
   if (!Number.isInteger(id) || id <= 0) {
-    await sendFn(`用法：channel ${action === 'delete' ? 'delete' : 'test'} <渠道ID>`);
+    await sendFn('用法：channel test <QQ渠道ID>');
     return;
   }
   if (action === 'test') {
     const channel = scheduler.getChannel(id, qqId);
-    if (!channel) {
-      await sendFn('渠道不存在。');
+    if (!channel || channel.type !== 'qq') {
+      await sendFn('QQ 渠道不存在。');
       return;
     }
     try {
@@ -910,19 +1326,7 @@ const handleChannelCommand = async (
     }
     return;
   }
-  if (action === 'delete') {
-    try {
-      await sendFn(
-        scheduler.deleteChannel(id, qqId)
-          ? '渠道已删除。'
-          : '渠道不存在，或 QQ 渠道不能删除。'
-      );
-    } catch (error) {
-      await sendFn(`删除失败：${error instanceof Error ? error.message : String(error)}`);
-    }
-    return;
-  }
-  await sendFn('用法：channel list | add | test | delete');
+  await sendFn('用法：channel list | test <QQ渠道ID>');
 };
 
 const handleUnnotifyCommand = async (
@@ -1054,18 +1458,16 @@ const handleHelp = async (
     '4. 查询定时通知：\n' +
     `${command} notify list\n\n` +
     '5. 设置定时通知：\n' +
-    `${command} notify <小时 (0-23)> [阈值] [通知项目] [channels=渠道ID,渠道ID]\n` +
+    `${command} notify <小时 (0-23)> [阈值] [通知项目]\n` +
     `   例：${command} notify 20 10\n` +
     '   每天晚上 8 点当任一余额低于 10 元时发送账单报告。\n' +
     `   例：${command} notify 20 10 e\n` +
     '   每天晚上 8 点当电费低于 10 元时发送账单报告（仅包含电费图表）。\n\n' +
     '6. 取消定时通知：\n' +
     `${command} unnotify\n\n` +
-    '7. 管理通知渠道（添加操作仅限私聊）：\n' +
+    '7. 查看或测试 QQ 通知渠道：\n' +
     `${command} channel list\n` +
-    `${command} channel add <feishu|dingtalk> <名称> <webhook> [secret]\n` +
-    `${command} channel test <渠道ID>\n` +
-    `${command} channel delete <渠道ID>\n\n` +
+    `${command} channel test <QQ渠道ID>\n\n` +
     '8. 设置更新间隔：\n' +
     `${command} interval [时间间隔]\n` +
     `   例：${command} interval 12h\n\n` +
@@ -1280,7 +1682,7 @@ napcat.on('message', async (context: AllHandlers['message']) => {
     } else if (subcommand === 'unnotify') {
       await handleUnnotifyCommand(qqId, context.message_type, chatId, send);
     } else if (subcommand === 'channel') {
-      await handleChannelCommand(params, qqId, isPrivateChat, send);
+      await handleChannelCommand(params, qqId, send);
     } else if (subcommand === 'interval') {
       await handleIntervalCommand(command, params, qqId, send);
     }

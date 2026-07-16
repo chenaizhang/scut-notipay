@@ -11,11 +11,21 @@
     "password": "your_card_password",
     "campus": "GZIC",
     "name": "宿舍余额",
-    "fetchInterval": "1d",
+    "fetchInterval": "4h",
+    "fetchJitterMinutes": 10,
     "notification": {
+      "enabledNotifications": ["daily", "lowBalance", "weeklyReport", "monthlyReport"],
       "hour": 8,
       "threshold": null,
-      "lines": "ewa",
+      "thresholds": {
+        "water": 20,
+        "electric": 15
+      },
+      "reports": {
+        "weekly": { "dayOfWeek": 1, "hour": 8, "minute": 5 },
+        "monthly": { "dayOfMonth": 1, "hour": 8, "minute": 10 }
+      },
+      "lines": "ew",
       "channel": {
         "type": "feishu",
         "name": "默认通知",

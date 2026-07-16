@@ -1,5 +1,5 @@
 import type { NCWebsocket } from 'node-napcat-ts';
-import { DingTalkProvider, FeishuProvider } from './providers/webhook.js';
+import { FeishuProvider } from './providers/webhook.js';
 import { QQProvider } from './providers/qq.js';
 import type {
   NotificationChannel,
@@ -17,10 +17,9 @@ export class NotificationService {
     }
   >();
 
-  constructor(napcat: NCWebsocket) {
-    this.register(new QQProvider(napcat));
-    this.register(new FeishuProvider());
-    this.register(new DingTalkProvider());
+  constructor(napcat: NCWebsocket, mode: 'standalone' | 'service') {
+    if (mode === 'standalone') this.register(new FeishuProvider());
+    else this.register(new QQProvider(napcat));
   }
 
   private register<TConfig extends NotificationChannelConfig>(

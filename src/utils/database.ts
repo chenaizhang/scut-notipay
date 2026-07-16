@@ -6,6 +6,7 @@ import { encryptionService } from './encryption.js';
 import config from '../../config.json' with { type: 'json' };
 import { NotificationScheduler } from './scheduler.js';
 import type { CAMPUSES } from './constants.js';
+import { normalizeCurrency } from './money.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -102,6 +103,13 @@ class StudentDatabase {
         qq_id TEXT NOT NULL,
         hour INTEGER NOT NULL CHECK(hour >= 0 AND hour <= 23),
         threshold REAL,
+        electric_threshold REAL,
+        water_threshold REAL,
+        ac_threshold REAL,
+        electric_alerted INTEGER NOT NULL DEFAULT 0,
+        water_alerted INTEGER NOT NULL DEFAULT 0,
+        ac_alerted INTEGER NOT NULL DEFAULT 0,
+        last_sent TEXT,
         lines TEXT DEFAULT 'ewa',
         created_at TEXT DEFAULT (datetime('now', 'localtime')),
         updated_at TEXT DEFAULT (datetime('now', 'localtime')),
@@ -113,7 +121,7 @@ class StudentDatabase {
       CREATE TABLE IF NOT EXISTS notification_channels (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         qq_id TEXT NOT NULL,
-        type TEXT NOT NULL CHECK(type IN ('qq', 'feishu', 'dingtalk')),
+        type TEXT NOT NULL CHECK(type IN ('qq', 'feishu')),
         name TEXT NOT NULL,
         destination_key TEXT NOT NULL,
         config_encrypted TEXT NOT NULL,
@@ -132,6 +140,15 @@ class StudentDatabase {
         FOREIGN KEY (notification_id) REFERENCES notifications(id) ON DELETE CASCADE,
         FOREIGN KEY (channel_id) REFERENCES notification_channels(id) ON DELETE CASCADE
       );
+
+      CREATE TABLE IF NOT EXISTS report_deliveries (
+        qq_id TEXT NOT NULL,
+        report_type TEXT NOT NULL CHECK(report_type IN ('weekly', 'monthly')),
+        period_key TEXT NOT NULL,
+        sent_at TEXT DEFAULT (datetime('now', 'localtime')),
+        PRIMARY KEY(qq_id, report_type, period_key),
+        FOREIGN KEY (qq_id) REFERENCES students(qq_id) ON DELETE CASCADE
+      );
     `;
 
     const createIndexSQL = `
@@ -142,6 +159,7 @@ class StudentDatabase {
       CREATE INDEX IF NOT EXISTS idx_chat ON notifications(chat_type, chat_id);
       CREATE INDEX IF NOT EXISTS idx_notification_channels_owner ON notification_channels(qq_id);
       CREATE INDEX IF NOT EXISTS idx_rule_channels_channel ON notification_rule_channels(channel_id);
+      CREATE INDEX IF NOT EXISTS idx_report_deliveries_owner ON report_deliveries(qq_id);
     `;
 
     this.db.exec(createStudentsTableSQL);
@@ -155,6 +173,21 @@ class StudentDatabase {
     const hasLinesColumn = tableInfo.some((col) => col.name === 'lines');
     if (!hasLinesColumn) {
       this.db.exec("ALTER TABLE notifications ADD COLUMN lines TEXT DEFAULT 'ewa'");
+    }
+
+    const notificationColumns = new Set(tableInfo.map((col) => col.name));
+    for (const column of ['electric_threshold', 'water_threshold', 'ac_threshold']) {
+      if (!notificationColumns.has(column)) {
+        this.db.exec(`ALTER TABLE notifications ADD COLUMN ${column} REAL`);
+      }
+    }
+    for (const column of ['electric_alerted', 'water_alerted', 'ac_alerted']) {
+      if (!notificationColumns.has(column)) {
+        this.db.exec(`ALTER TABLE notifications ADD COLUMN ${column} INTEGER NOT NULL DEFAULT 0`);
+      }
+    }
+    if (!notificationColumns.has('last_sent')) {
+      this.db.exec('ALTER TABLE notifications ADD COLUMN last_sent TEXT');
     }
   }
 
@@ -451,7 +484,13 @@ class StudentDatabase {
       INSERT INTO billing_history (qq_id, electric, water, ac, room)
       VALUES (?, ?, ?, ?, ?)
     `);
-    stmt.run(qqId, electric, water, ac, room);
+    stmt.run(
+      qqId,
+      normalizeCurrency(electric),
+      normalizeCurrency(water),
+      normalizeCurrency(ac),
+      room
+    );
   }
 
   /**
@@ -593,6 +632,48 @@ class StudentDatabase {
       room: string | null;
       recorded_at: string;
     } | null;
+  }
+
+  getBillingHistoryForReport(
+    qqId: string,
+    start: Date,
+    end: Date
+  ): Array<{
+    id: number;
+    qq_id: string;
+    electric: number;
+    water: number;
+    ac: number;
+    room: string | null;
+    recorded_at: string;
+  }> {
+    const format = (value: Date) => {
+      const pad = (part: number) => String(part).padStart(2, '0');
+      return `${value.getFullYear()}-${pad(value.getMonth() + 1)}-${pad(value.getDate())} ${pad(value.getHours())}:${pad(value.getMinutes())}:${pad(value.getSeconds())}`;
+    };
+    return this.db
+      .prepare(
+        `
+      SELECT * FROM billing_history
+      WHERE qq_id = ? AND recorded_at < ? AND (
+        recorded_at >= ? OR id = (
+          SELECT id FROM billing_history
+          WHERE qq_id = ? AND recorded_at < ?
+          ORDER BY recorded_at DESC LIMIT 1
+        )
+      )
+      ORDER BY recorded_at ASC
+    `
+      )
+      .all(qqId, format(end), format(start), qqId, format(start)) as Array<{
+      id: number;
+      qq_id: string;
+      electric: number;
+      water: number;
+      ac: number;
+      room: string | null;
+      recorded_at: string;
+    }>;
   }
 
   /**

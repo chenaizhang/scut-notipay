@@ -1,5 +1,7 @@
 import { createHmac } from 'crypto';
+import { normalizeCurrency } from '../../utils/money.js';
 import type {
+  NotificationChart,
   NotificationPayload,
   NotificationProvider,
   SendResult,
@@ -31,6 +33,70 @@ const validateWebhook = (url: string, hostname: string): void => {
   }
 };
 
+const formatChartTime = (timestamp: string): string => {
+  const value = new Date(timestamp);
+  if (Number.isNaN(value.getTime())) return timestamp;
+  const pad = (part: number) => String(part).padStart(2, '0');
+  return `${pad(value.getMonth() + 1)}-${pad(value.getDate())} ${pad(value.getHours())}:${pad(value.getMinutes())}`;
+};
+
+const prepareChartPoints = (chart: NotificationChart): NotificationChart['points'] => {
+  const uniquePoints = new Map<number, NotificationChart['points'][number]>();
+  for (const point of chart.points) {
+    const timestamp = new Date(point.timestamp).getTime();
+    if (
+      Number.isNaN(timestamp) ||
+      !Number.isFinite(point.electric) ||
+      !Number.isFinite(point.water)
+    )
+      continue;
+    uniquePoints.set(timestamp, {
+      ...point,
+      electric: normalizeCurrency(point.electric),
+      water: normalizeCurrency(point.water)
+    });
+  }
+  const points = [...uniquePoints.entries()]
+    .sort(([left], [right]) => left - right)
+    .map(([, point]) => point);
+  const maxPoints = 48;
+  if (points.length <= maxPoints) return points;
+  return Array.from(
+    { length: maxPoints },
+    (_, index) => points[Math.floor((index * (points.length - 1)) / (maxPoints - 1))]
+  );
+};
+
+const buildChartElement = (
+  chart: NotificationChart,
+  points: NotificationChart['points']
+): Record<string, unknown> => ({
+  tag: 'chart',
+  chart_spec: {
+    type: 'line',
+    title: { visible: true, text: chart.title },
+    data: {
+      values: points.flatMap((point) => [
+        { time: formatChartTime(point.timestamp), type: '电费', value: point.electric },
+        { time: formatChartTime(point.timestamp), type: '水费', value: point.water }
+      ])
+    },
+    xField: 'time',
+    yField: 'value',
+    seriesField: 'type',
+    legends: { visible: true, orient: 'bottom' },
+    point: { visible: points.length <= 24 },
+    line: { curveType: 'monotone' },
+    axes: [
+      { orient: 'left', title: { visible: true, text: '余额（元）' } },
+      { orient: 'bottom', label: { autoRotate: true, autoHide: true } }
+    ],
+    tooltip: { visible: true },
+    media: []
+  },
+  aspect_ratio: '16:9'
+});
+
 export class FeishuProvider implements NotificationProvider<WebhookChannelConfig> {
   readonly type = 'feishu' as const;
 
@@ -40,11 +106,24 @@ export class FeishuProvider implements NotificationProvider<WebhookChannelConfig
 
   async send(config: WebhookChannelConfig, payload: NotificationPayload): Promise<SendResult> {
     this.validateConfig(config);
+    const elements: Record<string, unknown>[] = [{ tag: 'markdown', content: payload.markdown }];
+    for (const chart of payload.charts ?? []) {
+      const points = prepareChartPoints(chart);
+      if (points.length >= 2) {
+        elements.push({ tag: 'hr' });
+        elements.push(buildChartElement(chart, points));
+      }
+    }
     const body: Record<string, unknown> = {
       msg_type: 'interactive',
       card: {
-        header: { title: { tag: 'plain_text', content: payload.title }, template: 'blue' },
-        elements: [{ tag: 'markdown', content: payload.markdown }]
+        schema: '2.0',
+        config: { summary: { content: payload.title } },
+        header: {
+          title: { tag: 'plain_text', content: payload.title },
+          template: payload.theme ?? 'blue'
+        },
+        body: { elements, vertical_spacing: '12px', padding: '12px' }
       }
     };
     if (config.secret) {
@@ -56,35 +135,6 @@ export class FeishuProvider implements NotificationProvider<WebhookChannelConfig
     const result = await postJson(config.webhookUrl, body);
     if (result.code !== undefined && result.code !== 0) {
       throw new Error(`飞书返回错误 ${String(result.code)}: ${String(result.msg ?? '')}`);
-    }
-    return {};
-  }
-}
-
-export class DingTalkProvider implements NotificationProvider<WebhookChannelConfig> {
-  readonly type = 'dingtalk' as const;
-
-  validateConfig(config: WebhookChannelConfig): void {
-    validateWebhook(config.webhookUrl, 'oapi.dingtalk.com');
-  }
-
-  async send(config: WebhookChannelConfig, payload: NotificationPayload): Promise<SendResult> {
-    this.validateConfig(config);
-    const url = new URL(config.webhookUrl);
-    if (config.secret) {
-      const timestamp = Date.now().toString();
-      const sign = createHmac('sha256', config.secret)
-        .update(`${timestamp}\n${config.secret}`)
-        .digest('base64');
-      url.searchParams.set('timestamp', timestamp);
-      url.searchParams.set('sign', sign);
-    }
-    const result = await postJson(url.toString(), {
-      msgtype: 'markdown',
-      markdown: { title: payload.title, text: `### ${payload.title}\n\n${payload.markdown}` }
-    });
-    if (result.errcode !== undefined && result.errcode !== 0) {
-      throw new Error(`钉钉返回错误 ${String(result.errcode)}: ${String(result.errmsg ?? '')}`);
     }
     return {};
   }

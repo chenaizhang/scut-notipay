@@ -1,4 +1,4 @@
-export type NotificationChannelType = 'qq' | 'feishu' | 'dingtalk';
+export type NotificationChannelType = 'qq' | 'feishu';
 
 export type QQChannelConfig = {
   chatType: 'private' | 'group';
@@ -33,6 +33,21 @@ export interface NotificationPayload {
   text: string;
   markdown: string;
   images: Array<{ filename: string; buffer: Buffer }>;
+  charts?: NotificationChart[];
+  theme?: NotificationCardTheme;
+}
+
+export type NotificationCardTheme = 'blue' | 'red' | 'green' | 'purple';
+
+export interface NotificationChartPoint {
+  timestamp: string;
+  electric: number;
+  water: number;
+}
+
+export interface NotificationChart {
+  title: string;
+  points: NotificationChartPoint[];
 }
 
 export interface SendResult {
